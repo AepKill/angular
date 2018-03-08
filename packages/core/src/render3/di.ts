@@ -8,6 +8,7 @@
 
 // We are temporarily importing the existing viewEngine_from core so we can be sure we are
 // correctly implementing its interfaces for backwards compatibility.
+import {ChangeDetectorRef as viewEngine_ChangeDetectorRef} from '../change_detection/change_detector_ref';
 import {Injector} from '../di/injector';
 import {ComponentFactory as viewEngine_ComponentFactory, ComponentRef as viewEngine_ComponentRef} from '../linker/component_factory';
 import {ElementRef as viewEngine_ElementRef} from '../linker/element_ref';
@@ -17,17 +18,17 @@ import {ViewContainerRef as viewEngine_ViewContainerRef} from '../linker/view_co
 import {EmbeddedViewRef as viewEngine_EmbeddedViewRef, ViewRef as viewEngine_ViewRef} from '../linker/view_ref';
 import {Type} from '../type';
 
-import {assertLessThan} from './assert';
+import {assertLessThan, assertNotNull} from './assert';
 import {assertPreviousIsParent, getDirectiveInstance, getPreviousOrParentNode, getRenderer, renderEmbeddedTemplate} from './instructions';
 import {ComponentTemplate, DirectiveDef} from './interfaces/definition';
 import {LInjector} from './interfaces/injector';
 import {LContainerNode, LElementNode, LNode, LNodeFlags, LViewNode} from './interfaces/node';
 import {QueryReadType} from './interfaces/query';
 import {Renderer3} from './interfaces/renderer';
-import {LView} from './interfaces/view';
 import {assertNodeOfPossibleTypes, assertNodeType} from './node_assert';
 import {insertView} from './node_manipulation';
 import {notImplemented, stringify} from './util';
+import {EmbeddedViewRef, ViewRef, addDestroyable, createViewRef} from './view_ref';
 
 
 
@@ -124,7 +125,8 @@ export function getOrCreateNodeInjectorForNode(node: LElementNode | LContainerNo
     injector: null,
     templateRef: null,
     viewContainerRef: null,
-    elementRef: null
+    elementRef: null,
+    changeDetectorRef: null
   };
 }
 
@@ -225,6 +227,103 @@ export function injectTemplateRef<T>(): viewEngine_TemplateRef<T> {
  */
 export function injectViewContainerRef(): viewEngine_ViewContainerRef {
   return getOrCreateContainerRef(getOrCreateNodeInjector());
+}
+
+/** Returns a ChangeDetectorRef (a.k.a. a ViewRef) */
+export function injectChangeDetectorRef(): viewEngine_ChangeDetectorRef {
+  return getOrCreateChangeDetectorRef(getOrCreateNodeInjector(), null);
+}
+
+/**
+ * Inject static attribute value into directive constructor.
+ *
+ * This method is used with `factory` functions which are generated as part of
+ * `defineDirective` or `defineComponent`. The method retrieves the static value
+ * of an attribute. (Dynamic attributes are not supported since they are not resolved
+ *  at the time of injection and can change over time.)
+ *
+ * # Example
+ * Given:
+ * ```
+ * @Component(...)
+ * class MyComponent {
+ *   constructor(@Attribute('title') title: string) { ... }
+ * }
+ * ```
+ * When instantiated with
+ * ```
+ * <my-component title="Hello"></my-component>
+ * ```
+ *
+ * Then factory method generated is:
+ * ```
+ * MyComponent.ngComponentDef = defineComponent({
+ *   factory: () => new MyComponent(injectAttribute('title'))
+ *   ...
+ * })
+ * ```
+ *
+ * @experimental
+ */
+export function injectAttribute(attrName: string): string|undefined {
+  ngDevMode && assertPreviousIsParent();
+  const lElement = getPreviousOrParentNode() as LElementNode;
+  ngDevMode && assertNodeType(lElement, LNodeFlags.Element);
+  const tElement = lElement.tNode !;
+  ngDevMode && assertNotNull(tElement, 'expecting tNode');
+  const attrs = tElement.attrs;
+  if (attrs) {
+    for (let i = 0; i < attrs.length; i = i + 2) {
+      if (attrs[i] == attrName) {
+        return attrs[i + 1];
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Creates a ViewRef and stores it on the injector as ChangeDetectorRef (public alias).
+ * Or, if it already exists, retrieves the existing instance.
+ *
+ * @returns The ChangeDetectorRef to use
+ */
+export function getOrCreateChangeDetectorRef(
+    di: LInjector, context: any): viewEngine_ChangeDetectorRef {
+  if (di.changeDetectorRef) return di.changeDetectorRef;
+
+  const currentNode = di.node;
+  if (currentNode.data === null) {
+    // if data is null, this node is a regular element node (not a component)
+    return di.changeDetectorRef = getOrCreateHostChangeDetector(currentNode.view.node);
+  } else if ((currentNode.flags & LNodeFlags.TYPE_MASK) === LNodeFlags.Element) {
+    // if it's an element node with data, it's a component and context will be set later
+    return di.changeDetectorRef = createViewRef(context);
+  }
+  return null !;
+}
+
+/** Gets or creates ChangeDetectorRef for the closest host component */
+function getOrCreateHostChangeDetector(currentNode: LViewNode | LElementNode):
+    viewEngine_ChangeDetectorRef {
+  const hostNode = getClosestComponentAncestor(currentNode);
+  const hostInjector = hostNode.nodeInjector;
+  const existingRef = hostInjector && hostInjector.changeDetectorRef;
+
+  return existingRef ? existingRef :
+                       createViewRef(hostNode.view.data[hostNode.flags >> LNodeFlags.INDX_SHIFT]);
+}
+
+/**
+ * If the node is an embedded view, traverses up the view tree to return the closest
+ * ancestor view that is attached to a component. If it's already a component node,
+ * returns itself.
+ */
+function getClosestComponentAncestor(node: LViewNode | LElementNode): LElementNode {
+  while ((node.flags & LNodeFlags.TYPE_MASK) === LNodeFlags.View) {
+    node = node.view.node;
+  }
+  return node as LElementNode;
 }
 
 /**
@@ -527,29 +626,6 @@ class TemplateRef<T> implements viewEngine_TemplateRef<T> {
 
   createEmbeddedView(context: T): viewEngine_EmbeddedViewRef<T> {
     let viewNode: LViewNode = renderEmbeddedTemplate(null, this._template, context, this._renderer);
-    return new EmbeddedViewRef(viewNode, this._template, context);
+    return addDestroyable(new EmbeddedViewRef(viewNode, this._template, context));
   }
-}
-
-class EmbeddedViewRef<T> implements viewEngine_EmbeddedViewRef<T> {
-  context: T;
-  rootNodes: any[];
-  /**
-   * @internal
-   */
-  _lViewNode: LViewNode;
-
-  constructor(viewNode: LViewNode, template: ComponentTemplate<T>, context: T) {
-    this._lViewNode = viewNode;
-    this.context = context;
-  }
-
-  destroy(): void { notImplemented(); }
-  destroyed: boolean;
-  onDestroy(callback: Function) { notImplemented(); }
-  markForCheck(): void { notImplemented(); }
-  detach(): void { notImplemented(); }
-  detectChanges(): void { notImplemented(); }
-  checkNoChanges(): void { notImplemented(); }
-  reattach(): void { notImplemented(); }
 }

@@ -18,17 +18,38 @@ WELL_KNOWN_GLOBALS = {
     "@angular/core": "ng.core",
     "@angular/common": "ng.common",
     "@angular/platform-browser": "ng.platformBrowser",
-    "rxjs/Observable": "Rx",
-    "rxjs/Observer": "Rx",
-    "rxjs/Subject": "Rx",
-    "rxjs/Subscription": "Rx",
-    "rxjs/observable/merge": "Rx.Observable",
-    "rxjs/observable/of": "Rx.Observable.prototype",
-    "rxjs/operator/concatMap": "Rx.Observable.prototype",
-    "rxjs/operator/filter": "Rx.Observable.prototype",
-    "rxjs/operator/map": "Rx.Observable.prototype",
-    "rxjs/operator/share": "Rx.Observable.prototype",
 }
+WELL_KNOWN_GLOBALS.update({"rxjs/%s" % s: "Rx" for s in [
+    "BehaviorSubject",
+    "Observable",
+    "Observer",
+    "Subject",
+    "Subscription",
+    "util/EmptyError",
+]})
+WELL_KNOWN_GLOBALS.update({"rxjs/observable/%s" % s: "Rx.Observable" for s in [
+    "from",
+    "fromPromise",
+    "forkJoin",
+    "merge",
+    "of",
+]})
+WELL_KNOWN_GLOBALS.update({"rxjs/operator/%s" % s: "Rx.Observable.prototype" for s in [
+    "catch",
+    "concatAll",
+    "concatMap",
+    "every",
+    "first",
+    "filter",
+    "last",
+    "map",
+    "mergeAll",
+    "mergeMap",
+    "reduce",
+    "share",
+    "toPromise",
+]})
+
 
 def _rollup(ctx, rollup_config, entry_point, inputs, js_output, format = "es"):
   map_output = ctx.actions.declare_file(js_output.basename + ".map", sibling = js_output)
@@ -102,7 +123,7 @@ def _ng_package_impl(ctx):
   esm5 = []
   bundles = []
 
-  for entry_point in [''] + ctx.attr.secondary_entry_points:
+  for entry_point in [""] + ctx.attr.secondary_entry_points:
     es2015_entry_point = "/".join([p for p in [
         ctx.bin_dir.path,
         ctx.label.package,
@@ -144,9 +165,8 @@ def _ng_package_impl(ctx):
                                         for dep in ctx.attr.deps
                                         if hasattr(dep, "angular")])
 
-  # TODO: the args look long, maybe need to spill to a params file:
-  # https://docs.bazel.build/versions/master/skylark/lib/Args.html#use_param_file
   args = ctx.actions.args()
+  args.use_param_file("%s", use_always = True)
   args.add(npm_package_directory.path)
   args.add(ctx.label.package)
   args.add([ctx.bin_dir.path, ctx.label.package], join_with="/")
@@ -172,7 +192,9 @@ def _ng_package_impl(ctx):
       progress_message = "Angular Packaging: building npm package for %s" % ctx.label.name,
       mnemonic = "AngularPackage",
       inputs = esm5_sources.to_list() +
-          ctx.files.deps +
+          depset(transitive = [d.typescript.transitive_declarations
+              for d in ctx.attr.deps
+              if hasattr(d, "typescript")]).to_list() +
           ctx.files.srcs +
           other_inputs,
       outputs = [npm_package_directory],

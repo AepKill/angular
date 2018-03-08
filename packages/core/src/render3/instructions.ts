@@ -10,9 +10,10 @@ import './ng_dev_mode';
 
 import {assertEqual, assertLessThan, assertNotEqual, assertNotNull, assertNull, assertSame} from './assert';
 import {LContainer, TContainer} from './interfaces/container';
-import {CssSelector, LProjection} from './interfaces/projection';
+import {LInjector} from './interfaces/injector';
+import {CssSelector, LProjection, NG_PROJECT_AS_ATTR_NAME} from './interfaces/projection';
 import {LQueries} from './interfaces/query';
-import {LView, LifecycleStage, TData, TView} from './interfaces/view';
+import {LView, LViewFlags, LifecycleStage, RootContext, TData, TView} from './interfaces/view';
 
 import {LContainerNode, LElementNode, LNode, LNodeFlags, LProjectionNode, LTextNode, LViewNode, TNode, TContainerNode, InitialInputData, InitialInputs, PropertyAliases, PropertyAliasValue,} from './interfaces/node';
 import {assertNodeType} from './node_assert';
@@ -22,6 +23,7 @@ import {ComponentDef, ComponentTemplate, ComponentType, DirectiveDef, DirectiveT
 import {RElement, RText, Renderer3, RendererFactory3, ProceduralRenderer3, ObjectOrientedRenderer3, RendererStyleFlags3, isProceduralRenderer} from './interfaces/renderer';
 import {isDifferent, stringify} from './util';
 import {executeHooks, executeContentHooks, queueLifecycleHooks, queueInitHooks, executeInitHooks} from './hooks';
+import {ViewRef} from './view_ref';
 
 /**
  * Directive (D) sets a property on all component instances using this constant as a key and the
@@ -29,6 +31,18 @@ import {executeHooks, executeContentHooks, queueLifecycleHooks, queueInitHooks, 
  * facilitate jumping from an instance to the host node.
  */
 export const NG_HOST_SYMBOL = '__ngHostLNode__';
+
+/**
+ * A permanent marker promise which signifies that the current CD tree is
+ * clean.
+ */
+const _CLEAN_PROMISE = Promise.resolve(null);
+
+/**
+ * Function used to sanitize the value before writing it into the renderer.
+ */
+export type Sanitizer = (value: any) => string;
+
 
 /**
  * This property gets set before entering a template.
@@ -108,7 +122,7 @@ export function getCreationMode(): boolean {
 }
 
 /**
- * An array of nodes (text, element, container, etc), their bindings, and
+ * An array of nodes (text, element, container, etc), pipes, their bindings, and
  * any local variables that need to be stored between invocations.
  */
 let data: any[];
@@ -159,7 +173,7 @@ export function enterView(newView: LView, host: LElementNode | LViewNode | null)
   data = newView && newView.data;
   bindingIndex = newView && newView.bindingStartIndex || 0;
   tData = newView && newView.tView.data;
-  creationMode = newView && newView.creationMode;
+  creationMode = newView && (newView.flags & LViewFlags.CreationMode) === LViewFlags.CreationMode;
 
   cleanup = newView && newView.cleanup;
   renderer = newView && newView.renderer;
@@ -183,7 +197,8 @@ export function leaveView(newView: LView): void {
   executeHooks(
       currentView.data, currentView.tView.viewHooks, currentView.tView.viewCheckHooks,
       creationMode);
-  currentView.creationMode = false;
+  // Views should be clean and in update mode after being checked, so these bits are cleared
+  currentView.flags &= ~(LViewFlags.CreationMode | LViewFlags.Dirty);
   currentView.lifecycleStage = LifecycleStage.INIT;
   currentView.tView.firstTemplatePass = false;
   enterView(newView, null);
@@ -191,10 +206,11 @@ export function leaveView(newView: LView): void {
 
 export function createLView(
     viewId: number, renderer: Renderer3, tView: TView, template: ComponentTemplate<any>| null,
-    context: any | null): LView {
+    context: any | null, flags: LViewFlags): LView {
   const newView = {
     parent: currentView,
-    id: viewId,    // -1 for component views
+    id: viewId,  // -1 for component views
+    flags: flags | LViewFlags.CreationMode,
     node: null !,  // until we initialize it in createNode.
     data: [],
     tView: tView,
@@ -204,7 +220,6 @@ export function createLView(
     tail: null,
     next: null,
     bindingStartIndex: null,
-    creationMode: true,
     template: template,
     context: context,
     dynamicViewCount: 0,
@@ -326,7 +341,7 @@ export function renderTemplate<T>(
         null, LNodeFlags.Element, hostNode,
         createLView(
             -1, providedRendererFactory.createRenderer(null, null), getOrCreateTView(template),
-            null, null));
+            null, {}, LViewFlags.CheckAlways));
   }
   const hostView = host.data !;
   ngDevMode && assertNotNull(hostView, 'Host node should have an LView defined in host.data.');
@@ -344,7 +359,8 @@ export function renderEmbeddedTemplate<T>(
     previousOrParentNode = null !;
     let cm: boolean = false;
     if (viewNode == null) {
-      const view = createLView(-1, renderer, createTView(), template, context);
+      const view =
+          createLView(-1, renderer, createTView(), template, context, LViewFlags.CheckAlways);
       viewNode = createLNode(null, LNodeFlags.View, null, view);
       cm = true;
     }
@@ -431,9 +447,10 @@ export function elementStart(
       let componentView: LView|null = null;
       if (isHostElement) {
         const tView = getOrCreateTView(hostComponentDef !.template);
-        componentView = addToViewTree(createLView(
+        const hostView = createLView(
             -1, rendererFactory.createRenderer(native, hostComponentDef !.rendererType), tView,
-            null, null));
+            null, null, hostComponentDef !.onPush ? LViewFlags.Dirty : LViewFlags.CheckAlways);
+        componentView = addToViewTree(hostView);
       }
 
       // Only component views should be added to the view tree directly. Embedded views are
@@ -455,12 +472,21 @@ export function elementStart(
       if (hostComponentDef) {
         // TODO(mhevery): This assumes that the directives come in correct order, which
         // is not guaranteed. Must be refactored to take it into account.
-        directiveCreate(++index, hostComponentDef.n(), hostComponentDef, queryName);
+        const instance = hostComponentDef.n();
+        directiveCreate(++index, instance, hostComponentDef, queryName);
+        initChangeDetectorIfExisting(node.nodeInjector, instance);
       }
       hack_declareDirectives(index, directiveTypes, localRefs);
     }
   }
   return native;
+}
+
+/** Sets the context for a ChangeDetectorRef to the given instance. */
+export function initChangeDetectorIfExisting(injector: LInjector | null, instance: any): void {
+  if (injector && injector.changeDetectorRef != null) {
+    (injector.changeDetectorRef as ViewRef<any>)._setComponentContext(instance);
+  }
 }
 
 /**
@@ -539,8 +565,12 @@ function setUpAttributes(native: RElement, attrs: string[]): void {
 
   const isProc = isProceduralRenderer(renderer);
   for (let i = 0; i < attrs.length; i += 2) {
-    isProc ? (renderer as ProceduralRenderer3).setAttribute(native, attrs[i], attrs[i | 1]) :
-             native.setAttribute(attrs[i], attrs[i | 1]);
+    const attrName = attrs[i];
+    if (attrName !== NG_PROJECT_AS_ATTR_NAME) {
+      const attrVal = attrs[i + 1];
+      isProc ? (renderer as ProceduralRenderer3).setAttribute(native, attrName, attrVal) :
+               native.setAttribute(attrName, attrVal);
+    }
   }
 }
 
@@ -579,12 +609,15 @@ export function locateHostElement(
  *
  * @param rNode Render host element.
  * @param def ComponentDef
+ *
+ * @returns LElementNode created
  */
-export function hostElement(rNode: RElement | null, def: ComponentDef<any>) {
+export function hostElement(rNode: RElement | null, def: ComponentDef<any>): LElementNode {
   resetApplicationState();
-  createLNode(
-      0, LNodeFlags.Element, rNode,
-      createLView(-1, renderer, getOrCreateTView(def.template), null, null));
+  return createLNode(
+      0, LNodeFlags.Element, rNode, createLView(
+                                        -1, renderer, getOrCreateTView(def.template), null, null,
+                                        def.onPush ? LViewFlags.Dirty : LViewFlags.CheckAlways));
 }
 
 
@@ -595,22 +628,26 @@ export function hostElement(rNode: RElement | null, def: ComponentDef<any>) {
  * and saves the subscription for later cleanup.
  *
  * @param eventName Name of the event
- * @param listener The function to be called when event emits
+ * @param listenerFn The function to be called when event emits
  * @param useCapture Whether or not to use capture in event listener.
  */
-export function listener(eventName: string, listener: EventListener, useCapture = false): void {
+export function listener(
+    eventName: string, listenerFn: (e?: any) => any, useCapture = false): void {
   ngDevMode && assertPreviousIsParent();
   const node = previousOrParentNode;
   const native = node.native as RElement;
 
   // In order to match current behavior, native DOM event listeners must be added for all
   // events (including outputs).
+  const cleanupFns = cleanup || (cleanup = currentView.cleanup = []);
   if (isProceduralRenderer(renderer)) {
-    const cleanupFn = renderer.listen(native, eventName, listener);
-    (cleanup || (cleanup = currentView.cleanup = [])).push(cleanupFn, null);
+    const wrappedListener = wrapListenerWithDirtyLogic(currentView, listenerFn);
+    const cleanupFn = renderer.listen(native, eventName, wrappedListener);
+    cleanupFns.push(cleanupFn, null);
   } else {
-    native.addEventListener(eventName, listener, useCapture);
-    (cleanup || (cleanup = currentView.cleanup = [])).push(eventName, native, listener, useCapture);
+    const wrappedListener = wrapListenerWithDirtyAndDefault(currentView, listenerFn);
+    native.addEventListener(eventName, wrappedListener, useCapture);
+    cleanupFns.push(eventName, native, wrappedListener, useCapture);
   }
 
   let tNode: TNode|null = node.tNode !;
@@ -623,7 +660,7 @@ export function listener(eventName: string, listener: EventListener, useCapture 
   const outputs = tNode.outputs;
   let outputData: PropertyAliasValue|undefined;
   if (outputs && (outputData = outputs[eventName])) {
-    createOutput(outputData, listener);
+    createOutput(outputData, listenerFn);
   }
 }
 
@@ -657,20 +694,22 @@ export function elementEnd() {
  * Updates the value of removes an attribute on an Element.
  *
  * @param number index The index of the element in the data array
- * @param string name The name of the attribute.
- * @param any value The attribute is removed when value is `null` or `undefined`.
+ * @param name name The name of the attribute.
+ * @param value value The attribute is removed when value is `null` or `undefined`.
  *                  Otherwise the attribute value is set to the stringified value.
+ * @param sanitizer An optional function used to sanitize the value.
  */
-export function elementAttribute(index: number, name: string, value: any): void {
+export function elementAttribute(
+    index: number, name: string, value: any, sanitizer?: Sanitizer): void {
   if (value !== NO_CHANGE) {
     const element: LElementNode = data[index];
     if (value == null) {
       isProceduralRenderer(renderer) ? renderer.removeAttribute(element.native, name) :
                                        element.native.removeAttribute(name);
     } else {
-      isProceduralRenderer(renderer) ?
-          renderer.setAttribute(element.native, name, stringify(value)) :
-          element.native.setAttribute(name, stringify(value));
+      const strValue = sanitizer == null ? stringify(value) : sanitizer(value);
+      isProceduralRenderer(renderer) ? renderer.setAttribute(element.native, name, strValue) :
+                                       element.native.setAttribute(name, strValue);
     }
   }
 }
@@ -686,9 +725,11 @@ export function elementAttribute(index: number, name: string, value: any): void 
  * @param propName Name of property. Because it is going to DOM, this is not subject to
  *        renaming as part of minification.
  * @param value New value to write.
+ * @param sanitizer An optional function used to sanitize the value.
  */
 
-export function elementProperty<T>(index: number, propName: string, value: T | NO_CHANGE): void {
+export function elementProperty<T>(
+    index: number, propName: string, value: T | NO_CHANGE, sanitizer?: Sanitizer): void {
   if (value === NO_CHANGE) return;
   const node = data[index] as LElementNode;
   const tNode = node.tNode !;
@@ -703,7 +744,9 @@ export function elementProperty<T>(index: number, propName: string, value: T | N
   let dataValue: PropertyAliasValue|undefined;
   if (inputData && (dataValue = inputData[propName])) {
     setInputsForProperty(dataValue, value);
+    markDirtyIfOnPush(node);
   } else {
+    value = (sanitizer != null ? sanitizer(value) : stringify(value)) as any;
     const native = node.native;
     isProceduralRenderer(renderer) ? renderer.setProperty(native, propName, value) :
                                      (native.setProperty ? native.setProperty(propName, value) :
@@ -809,10 +852,17 @@ export function elementClass<T>(index: number, className: string, value: T | NO_
  * @param styleName Name of property. Because it is going to DOM this is not subject to
  *        renaming as part of minification.
  * @param value New value to write (null to remove).
- * @param suffix Suffix to add to style's value (optional).
+ * @param suffix Optional suffix. Used with scalar values to add unit such as `px`.
+ * @param sanitizer An optional function used to transform the value typically used for
+ *        sanitization.
  */
 export function elementStyle<T>(
-    index: number, styleName: string, value: T | NO_CHANGE, suffix?: string): void {
+    index: number, styleName: string, value: T | NO_CHANGE, suffix?: string): void;
+export function elementStyle<T>(
+    index: number, styleName: string, value: T | NO_CHANGE, sanitizer?: Sanitizer): void;
+export function elementStyle<T>(
+    index: number, styleName: string, value: T | NO_CHANGE,
+    suffixOrSanitizer?: string | Sanitizer): void {
   if (value !== NO_CHANGE) {
     const lElement = data[index] as LElementNode;
     if (value == null) {
@@ -820,7 +870,9 @@ export function elementStyle<T>(
           renderer.removeStyle(lElement.native, styleName, RendererStyleFlags3.DashCase) :
           lElement.native.style.removeProperty(styleName);
     } else {
-      const strValue = suffix ? stringify(value) + suffix : stringify(value);
+      let strValue =
+          typeof suffixOrSanitizer == 'function' ? suffixOrSanitizer(value) : stringify(value);
+      if (typeof suffixOrSanitizer == 'string') strValue = strValue + suffixOrSanitizer;
       isProceduralRenderer(renderer) ?
           renderer.setStyle(lElement.native, styleName, strValue, RendererStyleFlags3.DashCase) :
           lElement.native.style.setProperty(styleName, strValue);
@@ -1149,7 +1201,8 @@ export function embeddedViewStart(viewBlockId: number): boolean {
   } else {
     // When we create a new LView, we always reset the state of the instructions.
     const newView = createLView(
-        viewBlockId, renderer, getOrCreateEmbeddedTView(viewBlockId, container), null, null);
+        viewBlockId, renderer, getOrCreateEmbeddedTView(viewBlockId, container), null, null,
+        LViewFlags.CheckAlways);
     if (lContainer.queries) {
       newView.queries = lContainer.queries.enterView(lContainer.nextIndex);
     }
@@ -1226,15 +1279,12 @@ export function directiveRefresh<T>(directiveIndex: number, elementIndex: number
     ngDevMode && assertNodeType(element, LNodeFlags.Element);
     ngDevMode &&
         assertNotNull(element.data, `Component's host node should have an LView attached.`);
-    ngDevMode && assertDataInRange(directiveIndex);
-    const directive = getDirectiveInstance<T>(data[directiveIndex]);
     const hostView = element.data !;
-    const oldView = enterView(hostView, element);
-    try {
-      template(directive, creationMode);
-    } finally {
-      refreshDynamicChildren();
-      leaveView(oldView);
+
+    // Only CheckAlways components or dirty OnPush components should be checked
+    if (hostView.flags & (LViewFlags.CheckAlways | LViewFlags.Dirty)) {
+      ngDevMode && assertDataInRange(directiveIndex);
+      detectChangesInternal(hostView, element, getDirectiveInstance<T>(data[directiveIndex]));
     }
   }
 }
@@ -1245,9 +1295,23 @@ export function directiveRefresh<T>(directiveIndex: number, elementIndex: number
  * each projected node belongs (it re-distributes nodes among "buckets" where each "bucket" is
  * backed by a selector).
  *
- * @param selectors
+ * This function requires CSS selectors to be provided in 2 forms: parsed (by a compiler) and text,
+ * un-parsed form.
+ *
+ * The parsed form is needed for efficient matching of a node against a given CSS selector.
+ * The un-parsed, textual form is needed for support of the ngProjectAs attribute.
+ *
+ * Having a CSS selector in 2 different formats is not ideal, but alternatives have even more
+ * drawbacks:
+ * - having only a textual form would require runtime parsing of CSS selectors;
+ * - we can't have only a parsed as we can't re-construct textual form from it (as entered by a
+ * template author).
+ *
+ * @param selectors A collection of parsed CSS selectors
+ * @param rawSelectors A collection of CSS selectors in the raw, un-parsed form
  */
-export function projectionDef(index: number, selectors?: CssSelector[]): void {
+export function projectionDef(
+    index: number, selectors?: CssSelector[], textSelectors?: string[]): void {
   const noOfNodeBuckets = selectors ? selectors.length + 1 : 1;
   const distributedNodes = new Array<LNode[]>(noOfNodeBuckets);
   for (let i = 0; i < noOfNodeBuckets; i++) {
@@ -1262,7 +1326,7 @@ export function projectionDef(index: number, selectors?: CssSelector[]): void {
     // - there are selectors defined
     // - a node has a tag name / attributes that can be matched
     if (selectors && componentChild.tNode) {
-      const matchedIdx = matchingSelectorIndex(componentChild.tNode, selectors !);
+      const matchedIdx = matchingSelectorIndex(componentChild.tNode, selectors, textSelectors !);
       distributedNodes[matchedIdx].push(componentChild);
     } else {
       distributedNodes[0].push(componentChild);
@@ -1387,6 +1451,179 @@ export function addToViewTree<T extends LView|LContainer>(state: T): T {
   currentView.tail ? (currentView.tail.next = state) : (currentView.child = state);
   currentView.tail = state;
   return state;
+}
+
+///////////////////////////////
+//// Change detection
+///////////////////////////////
+
+/** If node is an OnPush component, marks its LView dirty. */
+export function markDirtyIfOnPush(node: LElementNode): void {
+  // Because data flows down the component tree, ancestors do not need to be marked dirty
+  if (node.data && !(node.data.flags & LViewFlags.CheckAlways)) {
+    node.data.flags |= LViewFlags.Dirty;
+  }
+}
+
+/**
+ * Wraps an event listener so its host view and its ancestor views will be marked dirty
+ * whenever the event fires. Necessary to support OnPush components.
+ */
+export function wrapListenerWithDirtyLogic(view: LView, listenerFn: (e?: any) => any): (e: Event) =>
+    any {
+  return function(e: any) {
+    markViewDirty(view);
+    return listenerFn(e);
+  };
+}
+
+/**
+ * Wraps an event listener so its host view and its ancestor views will be marked dirty
+ * whenever the event fires. Also wraps with preventDefault behavior.
+ */
+export function wrapListenerWithDirtyAndDefault(
+    view: LView, listenerFn: (e?: any) => any): EventListener {
+  return function(e: Event) {
+    markViewDirty(view);
+    if (listenerFn(e) === false) {
+      e.preventDefault();
+      // Necessary for legacy browsers that don't support preventDefault (e.g. IE)
+      e.returnValue = false;
+    }
+  };
+}
+
+/** Marks current view and all ancestors dirty */
+function markViewDirty(view: LView): void {
+  let currentView: LView|null = view;
+
+  while (currentView.parent != null) {
+    currentView.flags |= LViewFlags.Dirty;
+    currentView = currentView.parent;
+  }
+  currentView.flags |= LViewFlags.Dirty;
+
+  ngDevMode && assertNotNull(currentView !.context, 'rootContext');
+  scheduleTick(currentView !.context as RootContext);
+}
+
+
+/**
+ * Used to schedule change detection on the whole application.
+ *
+ * Unlike `tick`, `scheduleTick` coalesces multiple calls into one change detection run.
+ * It is usually called indirectly by calling `markDirty` when the view needs to be
+ * re-rendered.
+ *
+ * Typically `scheduleTick` uses `requestAnimationFrame` to coalesce multiple
+ * `scheduleTick` requests. The scheduling function can be overridden in
+ * `renderComponent`'s `scheduler` option.
+ */
+export function scheduleTick<T>(rootContext: RootContext) {
+  if (rootContext.clean == _CLEAN_PROMISE) {
+    let res: null|((val: null) => void);
+    rootContext.clean = new Promise<null>((r) => res = r);
+    rootContext.scheduler(() => {
+      tick(rootContext.component);
+      res !(null);
+      rootContext.clean = _CLEAN_PROMISE;
+    });
+  }
+}
+
+/**
+ * Used to perform change detection on the whole application.
+ *
+ * This is equivalent to `detectChanges`, but invoked on root component. Additionally, `tick`
+ * executes lifecycle hooks and conditionally checks components based on their
+ * `ChangeDetectionStrategy` and dirtiness.
+ *
+ * The preferred way to trigger change detection is to call `markDirty`. `markDirty` internally
+ * schedules `tick` using a scheduler in order to coalesce multiple `markDirty` calls into a
+ * single change detection run. By default, the scheduler is `requestAnimationFrame`, but can
+ * be changed when calling `renderComponent` and providing the `scheduler` option.
+ */
+export function tick<T>(component: T): void {
+  const rootView = getRootView(component);
+  const rootComponent = (rootView.context as RootContext).component;
+  const hostNode = _getComponentHostLElementNode(rootComponent);
+
+  ngDevMode && assertNotNull(hostNode.data, 'Component host node should be attached to an LView');
+  renderComponentOrTemplate(hostNode, rootView, rootComponent);
+}
+
+/**
+ * Retrieve the root view from any component by walking the parent `LView` until
+ * reaching the root `LView`.
+ *
+ * @param component any component
+ */
+
+export function getRootView(component: any): LView {
+  ngDevMode && assertNotNull(component, 'component');
+  const lElementNode = _getComponentHostLElementNode(component);
+  let lView = lElementNode.view;
+  while (lView.parent) {
+    lView = lView.parent;
+  }
+  return lView;
+}
+
+/**
+ * Synchronously perform change detection on a component (and possibly its sub-components).
+ *
+ * This function triggers change detection in a synchronous way on a component. There should
+ * be very little reason to call this function directly since a preferred way to do change
+ * detection is to {@link markDirty} the component and wait for the scheduler to call this method
+ * at some future point in time. This is because a single user action often results in many
+ * components being invalidated and calling change detection on each component synchronously
+ * would be inefficient. It is better to wait until all components are marked as dirty and
+ * then perform single change detection across all of the components
+ *
+ * @param component The component which the change detection should be performed on.
+ */
+export function detectChanges<T>(component: T): void {
+  const hostNode = _getComponentHostLElementNode(component);
+  ngDevMode && assertNotNull(hostNode.data, 'Component host node should be attached to an LView');
+  detectChangesInternal(hostNode.data as LView, hostNode, component);
+}
+
+
+/** Checks the view of the component provided. Does not gate on dirty checks or execute doCheck. */
+function detectChangesInternal<T>(hostView: LView, hostNode: LElementNode, component: T) {
+  const componentIndex = hostNode.flags >> LNodeFlags.INDX_SHIFT;
+  const template = (hostNode.view.tView.data[componentIndex] as ComponentDef<T>).template;
+  const oldView = enterView(hostView, hostNode);
+
+  if (template != null) {
+    try {
+      template(component, creationMode);
+    } finally {
+      refreshDynamicChildren();
+      leaveView(oldView);
+    }
+  }
+}
+
+
+/**
+ * Mark the component as dirty (needing change detection).
+ *
+ * Marking a component dirty will schedule a change detection on this
+ * component at some point in the future. Marking an already dirty
+ * component as dirty is a noop. Only one outstanding change detection
+ * can be scheduled per component tree. (Two components bootstrapped with
+ * separate `renderComponent` will have separate schedulers)
+ *
+ * When the root component is bootstrapped with `renderComponent`, a scheduler
+ * can be provided.
+ *
+ * @param component Component to mark as dirty.
+ */
+export function markDirty<T>(component: T) {
+  ngDevMode && assertNotNull(component, 'component');
+  const lElementNode = _getComponentHostLElementNode(component);
+  markViewDirty(lElementNode.view);
 }
 
 ///////////////////////////////
@@ -1627,6 +1864,10 @@ export function bindingUpdated4(exp1: any, exp2: any, exp3: any, exp4: any): boo
   return bindingUpdated2(exp3, exp4) || different;
 }
 
+export function getTView(): TView {
+  return currentView.tView;
+}
+
 export function getDirectiveInstance<T>(instanceOrArray: T | [T]): T {
   // Directives with content queries store an array in data[directiveIndex]
   // with the instance as the first index
@@ -1649,3 +1890,12 @@ function assertDataInRange(index: number, arr?: any[]) {
 function assertDataNext(index: number) {
   assertEqual(data.length, index, 'index expected to be at the end of data');
 }
+
+export function _getComponentHostLElementNode<T>(component: T): LElementNode {
+  ngDevMode && assertNotNull(component, 'expecting component got null');
+  const lElementNode = (component as any)[NG_HOST_SYMBOL] as LElementNode;
+  ngDevMode && assertNotNull(component, 'object is not a component');
+  return lElementNode;
+}
+
+export const CLEAN_PROMISE = _CLEAN_PROMISE;

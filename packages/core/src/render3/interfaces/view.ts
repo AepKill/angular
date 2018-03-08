@@ -7,7 +7,7 @@
  */
 
 import {LContainer} from './container';
-import {ComponentTemplate, DirectiveDef} from './definition';
+import {ComponentTemplate, DirectiveDef, PipeDef} from './definition';
 import {LElementNode, LViewNode, TNode} from './node';
 import {LQueries} from './query';
 import {Renderer3} from './renderer';
@@ -24,15 +24,8 @@ import {Renderer3} from './renderer';
  * don't have to edit the data array based on which views are present.
  */
 export interface LView {
-  /**
-   * Whether or not the view is in creationMode.
-   *
-   * This must be stored in the view rather than using `data` as a marker so that
-   * we can properly support embedded views. Otherwise, when exiting a child view
-   * back into the parent view, `data` will be defined and `creationMode` will be
-   * improperly reported as false.
-   */
-  creationMode: boolean;
+  /** Flags for this view (see LViewFlags for definition of each bit). */
+  flags: LViewFlags;
 
   /**
    * The parent view is needed when we exit the view and must restore the previous
@@ -180,6 +173,25 @@ export interface LView {
   queries: LQueries|null;
 }
 
+/** Flags associated with an LView (saved in LView.flags) */
+export const enum LViewFlags {
+  /**
+   * Whether or not the view is in creationMode.
+   *
+   * This must be stored in the view rather than using `data` as a marker so that
+   * we can properly support embedded views. Otherwise, when exiting a child view
+   * back into the parent view, `data` will be defined and `creationMode` will be
+   * improperly reported as false.
+   */
+  CreationMode = 0b001,
+
+  /** Whether this view has default change detection strategy (checks always) or onPush */
+  CheckAlways = 0b010,
+
+  /** Whether or not this view is currently dirty (needing check) */
+  Dirty = 0b100
+}
+
 /** Interface necessary to work with view tree traversal */
 export interface LViewOrLContainer {
   next: LView|LContainer|null;
@@ -312,11 +324,11 @@ export const enum LifecycleStage {
  * Static data that corresponds to the instance-specific data array on an LView.
  *
  * Each node's static data is stored in tData at the same index that it's stored
- * in the data array. Each directive's definition is stored here at the same index
- * as its directive instance in the data array. Any nodes that do not have static
+ * in the data array. Each directive/pipe's definition is stored here at the same index
+ * as its directive/pipe instance in the data array. Any nodes that do not have static
  * data store a null value in tData to avoid a sparse array.
  */
-export type TData = (TNode | DirectiveDef<any>| null)[];
+export type TData = (TNode | DirectiveDef<any>| PipeDef<any>| null)[];
 
 // Note: This hack is necessary so we don't erroneously get a circular dependency
 // failure based on types.
